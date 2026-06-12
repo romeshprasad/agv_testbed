@@ -258,7 +258,7 @@ void setup() {
   alvik.begin();
   alvik.reset_pose(0, 0, 0, CM, DEG);
 
-  set_microros_wifi_transports("ISECapstone", "ISECap123", "192.168.0.137", 8888);
+  set_microros_wifi_transports("AGV_SWARM", "ISECap123", "192.168.1.143", 8888);
 
   ros_allocator = rcl_get_default_allocator();
   rclc_support_init(&ros_support, 0, NULL, &ros_allocator);
