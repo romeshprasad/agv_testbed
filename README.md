@@ -8,7 +8,8 @@ This system runs a fleet of Arduino Alvik AGVs on an 8×8 grid using ROS 2 and m
 
 ```
 AGV_MULTI_WS_DISPATCH/
-    AGV_MULTI_WS_DISPATCH.ino   ← Arduino sketch flashed to every Alvik
+    AGV_MULTI_WS_DISPATCH.ino   ← Original full sketch (PD + yaw-blend line follower)
+Line_Follow_Simple.ino          ← Current sketch flashed to every Alvik (see below)
 ORACLE_VM/
     dispatch_node.py            ← ROS 2 node: mission commands → token sequences → Alviks
     route_planner.py            ← Routing engine (no ROS dependency, pure Python)
@@ -16,6 +17,23 @@ ORACLE_VM/
     workstations.json           ← Workstation positions on the 8×8 grid
     INSTRUCTIONS.txt            ← Quick-reference launch cheat sheet
 ```
+
+### `Line_Follow_Simple.ino` vs `AGV_MULTI_WS_DISPATCH.ino`
+
+`Line_Follow_Simple.ino` is the version currently flashed to the Alviks. It keeps the
+same ROS/token/state-machine/color-detection scaffolding as `AGV_MULTI_WS_DISPATCH.ino`,
+but:
+
+- **Line following** is reduced to the plain proportional centroid controller from the
+  stock Arduino `Line_follower` example (`error = centroid(L,C,R)`, `control = error * KP`,
+  no D term, no yaw blend, no intersection blind window).
+- **Marker clearance is distance-based, not time-based** (see next section) — this is the
+  one behavioral change from the original dispatch sketch's marker-ignore logic.
+- Turn sequence (`turnGenericState`) is otherwise unchanged from `AGV_MULTI_WS_DISPATCH.ino`.
+
+The instructions below (flashing, network setup, MAC IDs, launch order) apply the same way
+to `Line_Follow_Simple.ino` — just open/flash that file instead of the one in
+`AGV_MULTI_WS_DISPATCH/`.
 
 ---
 
@@ -213,6 +231,50 @@ To add or change workstations, edit `workstations.json`. Each entry needs:
 ```
 
 `between_nodes` is the pair of grid nodes the workstation spur sits between.
+
+---
+
+## Marker clearance (position-based, in `Line_Follow_Simple.ino`)
+
+After the robot stops on/near a colored marker (red intersection sticker, yellow
+workstation sticker, or after completing a turn), color detection must be briefly
+suppressed — otherwise the robot immediately "re-detects" the marker it's still
+sitting on top of.
+
+`AGV_MULTI_WS_DISPATCH.ino` did this with **fixed-time ignore windows**
+(`MARKER_IGNORE_AFTER_RED_MS`, `EXIT_WORKSTATION_IGNORE_MS`, `YELLOW_ARM_AFTER_RED_MS`,
+`MARKER_IGNORE_AFTER_TURN_MS` — 600–1000 ms each). This caused intermittent missed
+red/yellow detections: the workstation legs (red→yellow, yellow→yellow, yellow→red,
+all ~4.5–5 in) are roughly **half** the length of a normal grid edge (red→red, ~10 in).
+A 1000 ms ignore window that's a safe fraction of a 10 in leg can cover most of a 4.5 in
+leg, leaving little time to detect the next marker before the robot is told to brake.
+
+`Line_Follow_Simple.ino` replaces all four time-based windows with a **single
+distance-based clearance** using odometry (`alvik.get_pose()`):
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `MARKER_CLEAR_DISTANCE_CM` | 3.8 (~1.5 in) | Distance the robot must travel from the last marker event before color detection resumes |
+
+When a marker event occurs (red detected, `YENTRY`/`EXIT`/`CLEAR` token issued, turn
+finished, or a new `run` script starts), `armMarkerClear()` records the current
+`(x, y)` pose. `targetColorDetectedStable()` ignores all color readings until the
+robot has moved `MARKER_CLEAR_DISTANCE_CM` from that point — regardless of how long
+that takes. Because the clearance distance is sized to the marker sticker (0.8 in
+diameter) rather than the leg length, it leaves several inches of margin even on the
+shortest 4.5 in workstation legs.
+
+The five old `*_IGNORE_*_MS` / `*_AFTER_*_MS` constants and the
+`marker_ignore_until_ms` / `pending_marker_ignore_ms` variables are left commented out
+in `Line_Follow_Simple.ino` for reference.
+
+**If the robot re-triggers on the marker it just left**: increase
+`MARKER_CLEAR_DISTANCE_CM`.
+
+**If the robot still misses a marker on a short leg**: decrease
+`MARKER_CLEAR_DISTANCE_CM`, or check `RED_STABLE_SAMPLES`/`YELLOW_STABLE_SAMPLES` and
+loop rate (`LOOP_DELAY_MS`) — a faster loop gives more chances to sample the marker
+during its (short) dwell time under the sensor.
 
 ---
 
