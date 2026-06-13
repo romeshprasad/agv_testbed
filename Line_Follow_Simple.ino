@@ -96,11 +96,19 @@ const unsigned long PRE_CENTER_BRAKE_MS           = 100;
 const unsigned long PRE_ROTATE_BRAKE_MS           = 200;
 const unsigned long POST_ROTATE_BRAKE_MS          = 200;
 const unsigned long POST_TURN_EXIT_MS             = 350;
-const unsigned long MARKER_IGNORE_AFTER_TURN_MS   = 600;
-const unsigned long MARKER_IGNORE_AFTER_RED_MS    = 1000;
-const unsigned long YELLOW_ARM_AFTER_RED_MS       = 750;
-const unsigned long YELLOW_IGNORE_AFTER_YAW_MS    = 300;
-const unsigned long EXIT_WORKSTATION_IGNORE_MS    = 1000;
+// const unsigned long MARKER_IGNORE_AFTER_TURN_MS   = 600;
+// const unsigned long MARKER_IGNORE_AFTER_RED_MS    = 1000;
+// const unsigned long YELLOW_ARM_AFTER_RED_MS       = 750;
+// const unsigned long YELLOW_IGNORE_AFTER_YAW_MS    = 300;
+// const unsigned long EXIT_WORKSTATION_IGNORE_MS    = 1000;
+
+// Position-based marker clearance: ignore color detection until the robot
+// has driven this far (cm) from the point where the last marker event
+// occurred. Marker stickers are 0.8" diameter; shortest leg (workstation
+// yellow-to-yellow) is 4.5". 1.5" (~3.8 cm) clears the sticker with margin
+// to spare on every leg, including the short workstation legs.
+const float         MARKER_CLEAR_DISTANCE_CM      = 3.8f;
+
 const unsigned long WORKSTATION_WAIT_MS           = 2000;
 const unsigned long WORKSTATION_BLINK_MS          = 250;
 const unsigned long CLEAR_MARKER_MS               = 500;
@@ -191,7 +199,10 @@ bool  last_yellow_now = false;
 bool  last_blue_now   = false;
 
 unsigned long lost_line_start_ms     = 0;
-unsigned long marker_ignore_until_ms = 0;
+// unsigned long marker_ignore_until_ms = 0;
+float         marker_clear_x        = 0.0f;
+float         marker_clear_y        = 0.0f;
+bool          marker_clear_armed    = false;
 TargetColor   last_marker_target     = TARGET_RED;
 int           marker_stable_count    = 0;
 
@@ -206,7 +217,7 @@ bool          pending_turn_absolute  = false;
 float         pending_absolute_yaw   = 0;
 unsigned long pending_center_ms         = 0;
 unsigned long pending_post_exit_ms      = 0;
-unsigned long pending_marker_ignore_ms  = MARKER_IGNORE_AFTER_TURN_MS;
+// unsigned long pending_marker_ignore_ms  = MARKER_IGNORE_AFTER_TURN_MS;
 
 unsigned long workstation_wait_start_ms = 0;
 unsigned long clear_start_ms            = 0;
@@ -249,6 +260,7 @@ float yawError(float tgt, float cur);
 void  startRotateAbsolute(float tgt);
 bool  updateRotateTo();
 
+void  armMarkerClear();
 bool  targetColorDetectedStable(TargetColor t, bool r, bool y, bool b);
 void  resetMarkerStable();
 bool  isRed(float h, float s, float v);
@@ -425,7 +437,7 @@ void execTokenState() {
       robot_state = DRIVE_TO_RED;
       break;
     case TOK_YENTRY:
-      marker_ignore_until_ms = millis() + YELLOW_ARM_AFTER_RED_MS;
+      armMarkerClear();
       resetMarkerStable();
       robot_state = DRIVE_TO_YENTRY;
       break;
@@ -440,7 +452,7 @@ void execTokenState() {
       robot_state = WORKSTATION_WAIT;
       break;
     case TOK_EXIT:
-      marker_ignore_until_ms = millis() + EXIT_WORKSTATION_IGNORE_MS;
+      armMarkerClear();
       resetMarkerStable();
       robot_state = DRIVE_OUT_TO_YENTRY;
       break;
@@ -450,21 +462,21 @@ void execTokenState() {
     case TOK_R:
       beginTurnToYaw(leg_target_yaw - 90.0f,
                      EXEC_TOKEN, TURN_CENTERING_MS, POST_TURN_EXIT_MS,
-                     MARKER_IGNORE_AFTER_TURN_MS);
+                     0);
       break;
     case TOK_L:
       beginTurnToYaw(leg_target_yaw + 90.0f,
                      EXEC_TOKEN, TURN_CENTERING_MS, POST_TURN_EXIT_MS,
-                     MARKER_IGNORE_AFTER_TURN_MS);
+                     0);
       break;
     case TOK_YAW0:
       beginTurnToYaw(REVERSE_DOCK_ABSOLUTE_YAW,
                      EXEC_TOKEN, 0, 0,
-                     YELLOW_IGNORE_AFTER_YAW_MS);
+                     0);
       break;
     case TOK_CLEAR:
-      clear_start_ms         = millis();
-      marker_ignore_until_ms = millis() + CLEAR_MARKER_MS + 150;
+      clear_start_ms = millis();
+      armMarkerClear();
       resetMarkerStable();
       robot_state = DO_CLEAR;
       break;
@@ -482,7 +494,7 @@ void advanceToNextToken() { robot_state = EXEC_TOKEN; }
 
 void driveToRedState() {
   if (driveForwardUntilColor(TARGET_RED, BASE_SPEED)) {
-    marker_ignore_until_ms = millis() + MARKER_IGNORE_AFTER_RED_MS;
+    armMarkerClear();
     resetMarkerStable();
     red_sticker_count++;
     advanceToNextToken();
@@ -637,7 +649,7 @@ void beginTurnToYaw(float yaw_target, RobotState next,
   after_turn_state        = next;
   pending_center_ms       = ctr;
   pending_post_exit_ms    = post;
-  pending_marker_ignore_ms = ign;
+  (void)ign;  // marker clearance is now position-based, armed in finishTurn()
 
   turn_phase          = TURN_PRE_CENTER_BRAKE;
   turn_phase_start_ms = millis();
@@ -729,7 +741,7 @@ void turnGenericState() {
 
 void finishTurn() {
   turn_phase             = TURN_IDLE;
-  marker_ignore_until_ms = millis() + pending_marker_ignore_ms;
+  armMarkerClear();
   float roll, pitch, imu_yaw;
   alvik.get_orientation(roll, pitch, imu_yaw);
   leg_target_yaw = imu_yaw;
@@ -790,8 +802,27 @@ bool updateRotateTo() {
 // MARKER / COLOR DETECTION
 // =====================================================
 
+// Record the current pose as the "marker clearance" origin. Color detection
+// stays gated until the robot has driven MARKER_CLEAR_DISTANCE_CM away from
+// this point (replaces the old fixed-time marker_ignore_until_ms windows).
+void armMarkerClear() {
+  float px, py, pyaw;
+  alvik.get_pose(px, py, pyaw, CM, DEG);
+  marker_clear_x     = px;
+  marker_clear_y     = py;
+  marker_clear_armed = true;
+}
+
 bool targetColorDetectedStable(TargetColor target, bool r, bool y, bool b) {
-  if (millis() < marker_ignore_until_ms) { resetMarkerStable(); return false; }
+  if (marker_clear_armed) {
+    float px, py, pyaw;
+    alvik.get_pose(px, py, pyaw, CM, DEG);
+    float dx = px - marker_clear_x;
+    float dy = py - marker_clear_y;
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist < MARKER_CLEAR_DISTANCE_CM) { resetMarkerStable(); return false; }
+    marker_clear_armed = false;
+  }
 
   bool now_det = (target == TARGET_RED)    ? r :
                  (target == TARGET_YELLOW) ? y : b;
@@ -962,11 +993,11 @@ void cmdCallback(const void* msgin) {
     emergency_printed       = false;
     lost_line_start_ms      = 0;
     red_sticker_count       = 0;
-    marker_ignore_until_ms  = millis() + 500;
     resetMarkerStable();
     turn_phase     = TURN_IDLE;
     alvik.reset_pose(0, 0, 0, CM, DEG);
     leg_target_yaw = 0.0f;
+    armMarkerClear();
 
     robot_state = EXEC_TOKEN;
     return;
