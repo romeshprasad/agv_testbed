@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""
+juan_supervisor.py  —  Step-by-step command supervisor for juan_code.ino
+
+juan_code.ino is a thin executor: it accepts ONE atomic command at a time on
+/agv/cmd, executes it, and publishes status updates on /agv/status. The PC
+(this script) is the brain — it holds the full route and sends the next
+command only after the robot reports it has finished the current one.
+
+Usage:
+    python3 juan_supervisor.py FORWARD_UNTIL_RED RIGHT_UNTIL_COLOR FORWARD_UNTIL_RED ...
+
+    # or load a route from route_planner-style tokens (R/L/RED -> juan commands):
+    python3 juan_supervisor.py --tokens R,RED,RED,L,RED
+
+    # or load a route from a file (one command per line, '#' comments allowed):
+    python3 juan_supervisor.py --file full_route_juan.txt
+
+Recognized juan_code.ino commands (sent verbatim on /agv/cmd):
+    FORWARD_UNTIL_RED     FORWARD_UNTIL_COLOR    BACKWARD_UNTIL_COLOR
+    FORWARD_UNTIL_YELLOW  BACKWARD_UNTIL_YELLOW
+    FORWARD_UNTIL_BLUE    BACKWARD_UNTIL_BLUE
+    RIGHT_UNTIL_COLOR     LEFT_UNTIL_COLOR       ROTATE_180
+    STOP                  RESET_POSE             GET_STATUS
+
+The robot reports "BUSY ..." while executing and "IDLE" (or "DETECTED ...",
+"TURN COMPLETE", "STOPPED", "POSE_RESET") when ready for the next command.
+This script waits for one of the "done" markers below before sending the
+next command in the sequence.
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String
+
+# Status strings that mean "robot is ready for the next command".
+# "TURN COMPLETE" / "ROTATE_180 COMPLETE" are informational only — juan_code.ino
+# always publishes "IDLE" right after them in the same step, so "IDLE" alone
+# is the real done signal. Including the others here causes a double-trigger:
+# the first message advances to the next command, then the still-in-flight
+# "IDLE" gets misread as that *next* command's done-marker.
+DONE_MARKERS = ("IDLE", "STOPPED", "POSE_RESET", "ERROR")
+
+# Map route_planner-style tokens to juan_code.ino commands (best-effort —
+# only covers tokens juan_code.ino actually understands).
+TOKEN_TO_CMD = {
+    "RED":    "FORWARD_UNTIL_RED",
+    "YELLOW": "FORWARD_UNTIL_YELLOW",
+    "BLUE":   "FORWARD_UNTIL_BLUE",
+    "R":      "RIGHT_UNTIL_COLOR",
+    "L":      "LEFT_UNTIL_COLOR",
+}
+
+
+class JuanSupervisor(Node):
+    def __init__(self, commands: list[str]):
+        super().__init__("juan_supervisor")
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+        self._commands = commands
+        self._index = 0
+        self._done_event = threading.Event()
+        self._skip_next_idle = False
+
+        self._cmd_pub = self.create_publisher(String, "/agv/cmd", qos)
+        self._status_sub = self.create_subscription(
+            String, "/agv/status", self._on_status, qos)
+
+        self.get_logger().info(f"Loaded {len(commands)} command(s)")
+
+    def _on_status(self, msg: String):
+        text = msg.data.strip()
+        self.get_logger().info(f"status: {text}")
+
+        if text.startswith("ERROR"):
+            self.get_logger().error(f"Robot reported error: {text}")
+            self._done_event.set()
+            return
+
+        # The robot sometimes double-publishes "IDLE" right after
+        # "TURN COMPLETE"/"ROTATE_180 COMPLETE", and the duplicate can
+        # arrive just after we've sent the next command. A bare "IDLE"
+        # immediately after sending can't be a real completion (no
+        # command finishes in milliseconds), so discard exactly one.
+        if self._skip_next_idle and text == "IDLE":
+            self._skip_next_idle = False
+            return
+        self._skip_next_idle = False
+
+        if any(text == m or text.startswith(m + " ") for m in DONE_MARKERS):
+            self._done_event.set()
+
+    def _send(self, cmd: str):
+        self.get_logger().info(f"-> {cmd}")
+        self._done_event.clear()
+        self._skip_next_idle = True
+        msg = String()
+        msg.data = cmd
+        self._cmd_pub.publish(msg)
+
+    def run(self, timeout_sec: float = 30.0) -> bool:
+        """Send each command in order, waiting for a done marker after each.
+        Returns True if all commands completed, False on timeout/error."""
+        for cmd in self._commands:
+            self._send(cmd)
+            if not self._done_event.wait(timeout=timeout_sec):
+                self.get_logger().error(
+                    f"Timed out waiting for robot to finish: {cmd}")
+                return False
+        self.get_logger().info("All commands completed.")
+        return True
+
+
+def commands_from_file(path: str) -> list[str]:
+    """Read one command per line. Blank lines and lines starting with
+    '#' (comments, e.g. '# --- WS visit #1 ---') are skipped."""
+    commands = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            commands.append(line.upper())
+    return commands
+
+
+def tokens_to_commands(token_csv: str) -> list[str]:
+    tokens = [t.strip().upper() for t in token_csv.split(",") if t.strip()]
+    commands = []
+    for tok in tokens:
+        if tok not in TOKEN_TO_CMD:
+            raise ValueError(
+                f"Token '{tok}' has no juan_code.ino equivalent "
+                f"(supported: {sorted(TOKEN_TO_CMD)})")
+        commands.append(TOKEN_TO_CMD[tok])
+    return commands
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        sys.exit(1)
+
+    if args[0] == "--tokens":
+        if len(args) != 2:
+            print("usage: juan_supervisor.py --tokens R,RED,RED,L,RED")
+            sys.exit(1)
+        commands = tokens_to_commands(args[1])
+    elif args[0] == "--file":
+        if len(args) != 2:
+            print("usage: juan_supervisor.py --file route.txt")
+            sys.exit(1)
+        commands = commands_from_file(args[1])
+    else:
+        commands = [a.upper() for a in args]
+
+    rclpy.init()
+    node = JuanSupervisor(commands)
+
+    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    spin_thread.start()
+
+    try:
+        ok = node.run()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

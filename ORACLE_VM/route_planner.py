@@ -187,60 +187,69 @@ def workstation_to_next_tokens(from_ws: Workstation, to_ws: Workstation) -> List
       R from S → W    L from S → E
       R from W → N    L from W → S
 
-    After EXIT the robot faces NORTH at the yellow entry sticker.
-    Strategy: move vertically first (N/S), then horizontally (E/W) to
-    arrive at to_ws.left_col facing EAST, then do YENTRY→spur→dock.
+    After EXIT the robot is back at the yellow entry sticker, on the main
+    grid line, facing NORTH (away from the spur) — it must turn before it
+    can drive along the row.
+
+    Minimal-turn strategy (one turn per direction change, same as the
+    working WS-to-WS and WS-to-depot patterns):
+      1. EXIT, then turn once toward to_ws.left_col (R→E if east, L→W if west).
+      2. Drive the column delta in reds.
+      3. If the row also changes, turn once onto the column (toward to_ws.row),
+         drive the row delta in reds, then turn once to face EAST for YENTRY.
+      4. If the row doesn't change, no further turn is needed before YENTRY
+         (already facing E from step 1) — or if delta_col == 0, turn directly
+         from N to face the row-delta direction, then turn to E afterward.
     """
     tokens: List[str] = []
 
     tokens.append("EXIT")           # drive N, stop at yellow entry (heading = N)
 
-    # --- Vertical move: current row → to_ws.row ---
-    delta_row = to_ws.row - from_ws.row   # positive = go north
-
-    if delta_row > 0:
-        # already facing N — count reds northward
-        tokens.extend(_red_tokens(delta_row))
-    elif delta_row < 0:
-        # N→R→E→R→S
-        tokens.append("R")          # face E
-        tokens.append("R")          # face S
-        tokens.extend(_red_tokens(-delta_row))
-        # now at correct row, heading S → turn to face E
-        tokens.append("L")          # S→L→E
-    # if delta_row == 0: still heading N, turn E below
-
-    # --- Horizontal move: current col → to_ws.left_col ---
-    # Heading is N (delta_row==0) or E (delta_row!=0) at this point.
-    # Normalise to E first, then handle the column delta.
     delta_col = to_ws.left_col - from_ws.left_col   # positive = go east
+    delta_row = to_ws.row - from_ws.row             # positive = go north
 
-    if delta_row == 0:
-        # heading is still N
-        if delta_col >= 0:
+    if delta_col == 0:
+        # already in the right column — just turn onto it and go to to_ws.row
+        if delta_row > 0:
+            tokens.extend(_red_tokens(delta_row))   # heading stays N
             tokens.append("R")      # N→R→E
-            if delta_col > 0:
-                tokens.extend(_red_tokens(delta_col))
-            # heading = E, at correct column
+        elif delta_row < 0:
+            tokens.append("R")      # N→R→E
+            tokens.append("R")      # E→R→S
+            tokens.extend(_red_tokens(-delta_row))
+            tokens.append("L")      # S→L→E
         else:
-            tokens.append("L")      # N→L→W
-            tokens.extend(_red_tokens(-delta_col))
-            # heading W → turn to E: W→R→N→R→E
-            tokens.append("R")      # W→R→N
             tokens.append("R")      # N→R→E
-    else:
-        # heading is already E (after vertical move)
-        if delta_col > 0:
-            tokens.extend(_red_tokens(delta_col))
-            # heading stays E
-        elif delta_col < 0:
-            # E→L→N→L→W
+        # heading = E
+    elif delta_col > 0:
+        tokens.append("R")          # N→R→E
+        tokens.extend(_red_tokens(delta_col))
+        # heading = E
+        if delta_row > 0:
             tokens.append("L")      # E→L→N
-            tokens.append("L")      # N→L→W
-            tokens.extend(_red_tokens(-delta_col))
-            # W→R→N→R→E
+            tokens.extend(_red_tokens(delta_row))
+            tokens.append("R")      # N→R→E
+        elif delta_row < 0:
+            tokens.append("R")      # E→R→S
+            tokens.extend(_red_tokens(-delta_row))
+            tokens.append("L")      # S→L→E
+        # heading = E
+    else:
+        tokens.append("L")          # N→L→W
+        tokens.extend(_red_tokens(-delta_col))
+        # heading = W
+        if delta_row > 0:
+            tokens.append("R")      # W→R→N
+            tokens.extend(_red_tokens(delta_row))
+            tokens.append("R")      # N→R→E
+        elif delta_row < 0:
+            tokens.append("L")      # W→L→S
+            tokens.extend(_red_tokens(-delta_row))
+            tokens.append("L")      # S→L→E
+        else:
             tokens.append("R")      # W→R→N
             tokens.append("R")      # N→R→E
+        # heading = E
 
     # --- Dock at to_ws (heading = E, at to_ws.left_col, to_ws.row) ---
     tokens.append("YENTRY")         # creep E to yellow entry sticker
@@ -267,6 +276,97 @@ def workstation_to_depot_tokens(ws: Workstation) -> List[str]:
     tokens.append("L")              # W→L→S
     tokens.append("BLUE")
     tokens.append("YAW0")
+    return tokens
+
+
+def snake_sweep_tokens(registry: dict[str, "Workstation"]) -> List[str]:
+    """
+    Connectivity test: serpentine ("snake") sweep through rows 1..7,
+    visiting every workstation whose entry row is on that row.
+
+    Not a real planner — just proves out RED/CLEAR/turn/YENTRY/.../EXIT
+    sequencing works end to end across the whole grid. The real
+    route_planner / MAPF solver replaces this later.
+
+    Robot starts at depot (row 1, col 1) facing NORTH.
+
+    For each row 1..7:
+      - turn onto the row (alternating East / West each row)
+      - drive across the row, counting RED/CLEAR between columns
+      - at each workstation whose entry row == this row, detour into
+        the spur at its left_col: turn toward the spur (R if heading
+        East, L if heading West), YENTRY,YWORK,YAW0,DOCK,DWELL,EXIT,
+        then turn back the same direction to resume the row heading
+      - turn to face the next row (North) and drive 1 RED to it
+
+    After row 7, return to depot: turn to face the depot column,
+    drive back, turn south, BLUE, YAW0.
+    """
+    # group workstations by entry row -> list of (left_col, ws_id)
+    by_row: dict[int, list[tuple[int, str]]] = {}
+    for ws_id, ws in registry.items():
+        by_row.setdefault(ws.row, []).append((ws.left_col, ws_id))
+    for row in by_row:
+        by_row[row].sort()
+
+    tokens: List[str] = []
+    heading = "E"   # current travel heading along the row (E or W)
+    cur_col = 1
+    cur_row = 1
+
+    for row in range(1, 8):
+        if row == 1:
+            # already at (row1, col1) facing N — turn onto the row
+            tokens.append("R" if heading == "E" else "L")  # N -> E or W
+        else:
+            # turn to face North, drive 1 RED to the new row, turn onto it
+            tokens.append("L" if heading == "E" else "R")  # heading -> N
+            tokens.append("RED")
+            cur_row = row
+            tokens.append("R" if heading == "E" else "L")  # N -> heading
+
+        stops = by_row.get(row, [])
+        stops = stops if heading == "E" else list(reversed(stops))
+
+        for left_col, ws_id in stops:
+            # drive along the row to this workstation's column
+            steps = abs(left_col - cur_col)
+            if steps > 0:
+                tokens.extend(_red_tokens(steps))
+            cur_col = left_col
+
+            # detour into the workstation spur and back
+            turn = "R" if heading == "E" else "L"
+            tokens.append(turn)          # heading -> S (into spur)
+            tokens.append("YENTRY")
+            tokens.append("YWORK")
+            tokens.append("YAW0")
+            tokens.append("DOCK")
+            tokens.append("DWELL")
+            tokens.append("EXIT")        # ends heading N
+            tokens.append(turn)          # N -> resume row heading (E/W)
+
+        # finish driving to the end of the row (col 8 if heading E, col 1 if W)
+        target_col = 8 if heading == "E" else 1
+        steps = abs(target_col - cur_col)
+        if steps > 0:
+            tokens.extend(_red_tokens(steps))
+        cur_col = target_col
+
+        heading = "W" if heading == "E" else "E"
+
+    # --- return to depot (row 7, col cur_col, heading = current) -> (row1, col1) ---
+    # turn to face South, drive back down to row 1, turn to face West (if needed), BLUE
+    tokens.append("R" if heading == "E" else "L")   # heading -> S
+    tokens.extend(_red_tokens(cur_row - 1))
+    cur_row = 1
+    # now at (row1, cur_col) heading S; turn to face West, drive to col1
+    tokens.append("L")                              # S -> W
+    tokens.extend(_red_tokens(cur_col - 1))
+    tokens.append("L")                              # W -> S
+    tokens.append("BLUE")
+    tokens.append("YAW0")
+
     return tokens
 
 
@@ -328,6 +428,36 @@ def to_token_string(tokens: List[str]) -> str:
 def to_run_command(tokens: List[str]) -> str:
     """Format tokens as a 'run ...' ROS command string."""
     return "run " + to_token_string(tokens)
+
+
+# Arduino's cmd_buf is 512 bytes; leave headroom for the "run "/"append "
+# prefix and the trailing NUL the micro-ROS string transport adds.
+_CMD_BUF_LIMIT = 512
+_SAFE_CMD_LEN = 480
+
+
+def to_chunked_commands(tokens: List[str], max_len: int = _SAFE_CMD_LEN) -> List[str]:
+    """
+    Split tokens into a sequence of ROS command strings that each fit within
+    the Arduino's cmd_buf (512 bytes). The first chunk uses 'run', every
+    subsequent chunk uses 'append' so the script keeps building on the robot
+    without resetting token_index.
+    """
+    commands: List[str] = []
+    chunk: List[str] = []
+    for tok in tokens:
+        prefix = "run " if not commands and not chunk else "append "
+        candidate = chunk + [tok]
+        if len(prefix + to_token_string(candidate)) > max_len and chunk:
+            verb = "run" if not commands else "append"
+            commands.append(f"{verb} " + to_token_string(chunk))
+            chunk = [tok]
+        else:
+            chunk = candidate
+    if chunk:
+        verb = "run" if not commands else "append"
+        commands.append(f"{verb} " + to_token_string(chunk))
+    return commands
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +562,13 @@ if __name__ == "__main__":
     p_route.add_argument("--ws-json", type=Path, default=_DEFAULT_JSON,
                          help="Path to workstations.json")
 
+    p_sweep = sub.add_parser("sweep", help="Build the full-grid snake-sweep test route "
+                             "(visits all workstations, connectivity test only).")
+    p_sweep.add_argument("--agv", default="Alvik1")
+    p_sweep.add_argument("--format", choices=("tokens", "command", "explain", "chunked"),
+                          default="command")
+    p_sweep.add_argument("--ws-json", type=Path, default=_DEFAULT_JSON)
+
     p_rand = sub.add_parser("random", help="Build a random route.")
     p_rand.add_argument("n", type=int, help="Number of workstations to visit")
     p_rand.add_argument("--seed", type=int, default=None)
@@ -449,6 +586,10 @@ if __name__ == "__main__":
                  for i in args.workstations]
         plan  = RoutePlan(agv_id=args.agv, workstation_ids=ids,
                           return_to_depot=not args.no_return).build(registry)
+    elif args.cmd == "sweep":
+        tokens = snake_sweep_tokens(registry)
+        plan = RoutePlan(agv_id=args.agv, workstation_ids=sorted(registry.keys()))
+        plan.tokens = tokens
     else:
         ids, tokens = random_route(args.n, registry=registry, seed=args.seed,
                                    return_to_depot=not args.no_return)
@@ -467,3 +608,10 @@ if __name__ == "__main__":
         print(explain_tokens(plan.tokens))
     elif fmt == "json":
         print(json.dumps(plan.to_dict(), indent=2))
+    elif fmt == "chunked":
+        topic = f"/{args.agv}_cmd"
+        for cmd in to_chunked_commands(plan.tokens):
+            print(
+                f"ros2 topic pub --once {topic} std_msgs/msg/String "
+                f"\"{{data: '{cmd}'}}\" --qos-reliability best_effort"
+            )

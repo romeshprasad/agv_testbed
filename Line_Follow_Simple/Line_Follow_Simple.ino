@@ -38,7 +38,7 @@ Arduino_Alvik alvik;
 
 char WIFI_SSID[]     = "AGV_SWARM";
 char WIFI_PASSWORD[] = "ISECap123";
-char AGENT_IP[]      = "192.168.1.141";
+char AGENT_IP[]      = "192.168.1.143";
 const uint32_t AGENT_PORT = 8888;
 
 char ROBOT_NAME[16] = "";
@@ -67,35 +67,33 @@ const unsigned long STATUS_PERIOD_MS = 200;
 // TUNING  — only these two matter for line following
 // =====================================================
 
-const float BASE_SPEED = 60.0f;   // RPM, both wheels when centered
-const float KP         = 50.0f;   // proportional gain on centroid error
+const float BASE_SPEED = 50.0f;   // RPM, both wheels when centered
+const float KP         = 25.0f;   // proportional gain on centroid error
+const float MAX_CORRECTION = 20.0f;  // clamp on wheel-speed differential from line error
 
 // Speeds for special manoeuvres — adjust if needed
 const float YELLOW_SEARCH_SPEED        = 20.0f;
 const float WORKSTATION_APPROACH_SPEED = 30.0f;
 const float REVERSE_DOCK_SPEED         = 20.0f;
 const float CLEAR_MARKER_SPEED         = 28.0f;
-const float POST_TURN_EXIT_SPEED       = 25.0f;
+const float STICKER_CROSS_SPEED        = 60.0f;  // both wheels straight while off black tape (crossing a sticker)
 
 // Turn controller
 const float YAW_TOLERANCE  = 3.0f;
 const float TURN_MIN_SPEED = 5.0f;
-const float TURN_MAX_SPEED = 60.0f;
+const float TURN_MAX_SPEED = 20.0f;
 const float REVERSE_DOCK_ABSOLUTE_YAW = 0.0f;
 
 // Tape / marker thresholds
 const int   TAPE_THRESHOLD  = 250;
-const int   RED_STABLE_SAMPLES    = 1;
+const int   RED_STABLE_SAMPLES    = 4;
 const int   YELLOW_STABLE_SAMPLES = 1;
 const int   BLUE_STABLE_SAMPLES   = 5;
 
 // Timing guards
 const unsigned long TURN_CONTROL_MS               = 2;
-const unsigned long TURN_CENTERING_MS             = 250;
-const unsigned long PRE_CENTER_BRAKE_MS           = 100;
 const unsigned long PRE_ROTATE_BRAKE_MS           = 200;
 const unsigned long POST_ROTATE_BRAKE_MS          = 200;
-const unsigned long POST_TURN_EXIT_MS             = 350;
 // const unsigned long MARKER_IGNORE_AFTER_TURN_MS   = 600;
 // const unsigned long MARKER_IGNORE_AFTER_RED_MS    = 1000;
 // const unsigned long YELLOW_ARM_AFTER_RED_MS       = 750;
@@ -166,12 +164,9 @@ RobotState after_turn_state = DONE;
 
 enum TurnPhase : uint8_t {
   TURN_IDLE,
-  TURN_PRE_CENTER_BRAKE,
-  TURN_CENTER_FORWARD,
   TURN_PRE_ROTATE_BRAKE,
   TURN_ROTATING,
-  TURN_POST_ROTATE_BRAKE,
-  TURN_POST_EXIT
+  TURN_POST_ROTATE_BRAKE
 };
 
 TurnPhase turn_phase = TURN_IDLE;
@@ -215,9 +210,6 @@ int           turn_settled_count     = 0;
 float         pending_turn_angle     = 0;
 bool          pending_turn_absolute  = false;
 float         pending_absolute_yaw   = 0;
-unsigned long pending_center_ms         = 0;
-unsigned long pending_post_exit_ms      = 0;
-// unsigned long pending_marker_ignore_ms  = MARKER_IGNORE_AFTER_TURN_MS;
 
 unsigned long workstation_wait_start_ms = 0;
 unsigned long clear_start_ms            = 0;
@@ -252,8 +244,7 @@ float calculateCenterError(int l, int c, int r);
 bool  isOnTape(int l, int c, int r);
 bool  isIntersection(int l, int c, int r);
 
-void  beginTurnToYaw(float yaw_target, RobotState next,
-                     unsigned long ctr, unsigned long post, unsigned long ign);
+void  beginTurnToYaw(float yaw_target, RobotState next);
 void  finishTurn();
 float normalizeYaw(float a);
 float yawError(float tgt, float cur);
@@ -460,19 +451,13 @@ void execTokenState() {
       robot_state = DRIVE_TO_BLUE;
       break;
     case TOK_R:
-      beginTurnToYaw(leg_target_yaw - 90.0f,
-                     EXEC_TOKEN, TURN_CENTERING_MS, POST_TURN_EXIT_MS,
-                     0);
+      beginTurnToYaw(leg_target_yaw - 83.0f, EXEC_TOKEN);
       break;
     case TOK_L:
-      beginTurnToYaw(leg_target_yaw + 90.0f,
-                     EXEC_TOKEN, TURN_CENTERING_MS, POST_TURN_EXIT_MS,
-                     0);
+      beginTurnToYaw(leg_target_yaw + 83.0f, EXEC_TOKEN);
       break;
     case TOK_YAW0:
-      beginTurnToYaw(REVERSE_DOCK_ABSOLUTE_YAW,
-                     EXEC_TOKEN, 0, 0,
-                     0);
+      beginTurnToYaw(REVERSE_DOCK_ABSOLUTE_YAW, EXEC_TOKEN);
       break;
     case TOK_CLEAR:
       clear_start_ms = millis();
@@ -613,8 +598,14 @@ bool reverseStraightUntilColor(TargetColor target) {
 // =====================================================
 
 void followLine(int l, int c, int r, float base_speed) {
+  if (!isOnTape(l, c, r)) {
+    // Off black tape (crossing a colored sticker) — sensor readings are not
+    // reliable here, so hold a straight heading instead of reacting to noise.
+    alvik.set_wheels_speed(STICKER_CROSS_SPEED, STICKER_CROSS_SPEED, RPM);
+    return;
+  }
   float error   = calculateCenterError(l, c, r);
-  float control = error * KP;
+  float control = constrain(error * KP, -MAX_CORRECTION, MAX_CORRECTION);
   alvik.set_wheels_speed(base_speed - control, base_speed + control, RPM);
 }
 
@@ -635,11 +626,12 @@ bool isIntersection(int l, int c, int r) {
 }
 
 // =====================================================
-// TURN CONTROL  — unchanged from AGV_MULTI_WS_DISPATCH
+// TURN CONTROL  — simple pivot-rotate (brake, rotate to absolute
+// yaw via IMU, brake). Used for R, L, and YAW0 alike; the next
+// token's line-following re-acquires the line afterward.
 // =====================================================
 
-void beginTurnToYaw(float yaw_target, RobotState next,
-                    unsigned long ctr, unsigned long post, unsigned long ign) {
+void beginTurnToYaw(float yaw_target, RobotState next) {
   alvik.brake();
   setLEDYellow();
 
@@ -647,11 +639,8 @@ void beginTurnToYaw(float yaw_target, RobotState next,
   pending_absolute_yaw    = yaw_target;
   pending_turn_angle      = 0.0f;
   after_turn_state        = next;
-  pending_center_ms       = ctr;
-  pending_post_exit_ms    = post;
-  (void)ign;  // marker clearance is now position-based, armed in finishTurn()
 
-  turn_phase          = TURN_PRE_CENTER_BRAKE;
+  turn_phase          = TURN_PRE_ROTATE_BRAKE;
   turn_phase_start_ms = millis();
   robot_state         = TURN_GENERIC;
   resetMarkerStable();
@@ -662,32 +651,8 @@ void turnGenericState() {
 
   switch (turn_phase) {
     case TURN_IDLE:
-      turn_phase          = TURN_PRE_CENTER_BRAKE;
+      turn_phase          = TURN_PRE_ROTATE_BRAKE;
       turn_phase_start_ms = now;
-      break;
-
-    case TURN_PRE_CENTER_BRAKE:
-      alvik.brake();
-      setLEDYellow();
-      if (now - turn_phase_start_ms >= PRE_CENTER_BRAKE_MS) {
-        if (pending_center_ms > 0) {
-          alvik.set_wheels_speed(POST_TURN_EXIT_SPEED, POST_TURN_EXIT_SPEED, RPM);
-          turn_phase          = TURN_CENTER_FORWARD;
-          turn_phase_start_ms = now;
-        } else {
-          turn_phase          = TURN_PRE_ROTATE_BRAKE;
-          turn_phase_start_ms = now;
-        }
-      }
-      break;
-
-    case TURN_CENTER_FORWARD:
-      setLEDYellow();
-      if (now - turn_phase_start_ms >= pending_center_ms) {
-        alvik.brake();
-        turn_phase          = TURN_PRE_ROTATE_BRAKE;
-        turn_phase_start_ms = now;
-      }
       break;
 
     case TURN_PRE_ROTATE_BRAKE:
@@ -711,31 +676,9 @@ void turnGenericState() {
       alvik.brake();
       setLEDYellow();
       if (now - turn_phase_start_ms >= POST_ROTATE_BRAKE_MS) {
-        if (pending_post_exit_ms > 0) {
-          alvik.set_wheels_speed(POST_TURN_EXIT_SPEED, POST_TURN_EXIT_SPEED, RPM);
-          turn_phase          = TURN_POST_EXIT;
-          turn_phase_start_ms = now;
-        } else {
-          finishTurn();
-        }
-      }
-      break;
-
-    case TURN_POST_EXIT: {
-      setLEDYellow();
-      int l, c, r;
-      alvik.get_line_sensors(l, c, r);
-      if (isOnTape(l, c, r) && !isIntersection(l, c, r)) {
-        followLine(l, c, r, POST_TURN_EXIT_SPEED);
-      } else {
-        alvik.set_wheels_speed(POST_TURN_EXIT_SPEED, POST_TURN_EXIT_SPEED, RPM);
-      }
-      if (now - turn_phase_start_ms >= pending_post_exit_ms) {
-        alvik.brake();
         finishTurn();
       }
       break;
-    }
   }
 }
 
