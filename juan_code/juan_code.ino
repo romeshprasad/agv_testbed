@@ -3,9 +3,9 @@
 // Arduino Alvik — micro-ROS over WiFi
 // Low-level motion primitive executor (v1.1)
 //
-// Topics:
-// /agv/status (publisher)
-// /agv/cmd (subscriber)
+// Topics (per-robot, named via MAC-based identity — see getAlvikID()):
+// <ROBOT_NAME>_status (publisher), e.g. Alvik1_status
+// <ROBOT_NAME>_cmd    (subscriber), e.g. Alvik1_cmd
 //
 // CAMBIO v1.1: al detectar color/marca, el robot avanza/retrocede 0.5 s
 // adicionales antes de frenar y publicar DETECTED.
@@ -31,6 +31,11 @@ char WIFI_PASSWORD[] = "ISECap123";
 char AGENT_IP[] = "192.168.1.143";
 const uint32_t AGENT_PORT = 8888;
 
+// Per-robot identity / topic names, filled by getAlvikID() in setup()
+char ROBOT_NAME[16] = "";
+char T_STATUS[32];
+char T_CMD[32];
+
 // =============================================================================
 // micro-ROS objects
 // =============================================================================
@@ -53,7 +58,7 @@ unsigned long last_status_ms = 0;
 // Tuning constants
 // =============================================================================
 const int TAPE_THRESHOLD = 275;
-const float BASE_SPEED = 50.0f;
+const float BASE_SPEED = 50.0f; // 50 works the best
 const float BACKWARD_SPEED = 20.0f;
 const float KP = 25.0f;
 const float MAX_CORRECTION = 20.0f;
@@ -70,6 +75,10 @@ const unsigned long LOOP_DELAY_MS = 10;
 
 // Tiempo extra de avance tras detectar color/marca, antes de frenar
 const unsigned long ADVANCE_AFTER_DETECT_MS = 200;
+
+// Tiempo de espera (dwell) en una estacion de trabajo
+const unsigned long WORKSTATION_WAIT_MS = 2000;
+const unsigned long WORKSTATION_BLINK_MS = 250;
 
 // =============================================================================
 // State machine
@@ -93,6 +102,7 @@ enum AGVState {
  STATE_ADVANCE_AFTER_BACKWARD_COLOR,
  STATE_ADVANCE_AFTER_BACKWARD_YELLOW,
  STATE_ADVANCE_AFTER_BACKWARD_BLUE,
+ STATE_DWELL,
  STATE_ERROR
 };
 
@@ -114,6 +124,7 @@ bool line_was_lost = false;
 unsigned long last_turn_control_ms = 0;
 unsigned long marker_ignore_until_ms = 0; // ignora color al arrancar un comando
 unsigned long advance_until_ms = 0; // hasta cuándo seguir avanzando tras detectar color
+unsigned long dwell_until_ms = 0; // hasta cuándo esperar en la estacion de trabajo
 
 const unsigned long CMD_MARKER_IGNORE_MS = 700; // ms a ignorar color tras recibir comando
 
@@ -180,7 +191,8 @@ bool isYellow(float h, float s, float v, float nr, float ng, float nb, int left,
 
  if (black_tape_false_yellow) return false;
 
- bool hue_yellow = h > 32.0f && h < 50.0f;
+ // bool hue_yellow = h > 32.0f && h < 50.0f; // works for Alvik1, Alvik2, Alvik4
+ bool hue_yellow = h > 25.0f && h < 50.0f;
  bool strongly_saturated = s > 0.60f;
  bool bright_enough = v > 0.08f;
  bool colorful_enough = chroma > 0.075f;
@@ -440,6 +452,12 @@ void cmdCallback(const void* msgin) {
  startTurn(180.0f);
  current_state = STATE_ROTATE_180; is_busy = true;
 
+ } else if (cmd == "DWELL") {
+ alvik.brake();
+ publish_status("BUSY DWELL");
+ dwell_until_ms = millis() + WORKSTATION_WAIT_MS;
+ current_state = STATE_DWELL; is_busy = true;
+
  } else if (cmd == "STOP") {
  alvik.brake(); publish_status("STOPPED");
  current_state = IDLE; is_busy = false;
@@ -617,10 +635,48 @@ void update_state_machine() {
  }
  break;
 
+ case STATE_DWELL:
+ alvik.brake();
+ if (((millis() / WORKSTATION_BLINK_MS) % 2) == 0) setLEDYellow(); else setLEDOff();
+ if (millis() >= dwell_until_ms) {
+ setLEDGreen();
+ publish_status("DWELL COMPLETE");
+ publish_status("IDLE");
+ current_state = IDLE; is_busy = false;
+ }
+ break;
+
  case STATE_ERROR:
  alvik.brake();
  break;
  }
+}
+
+// =============================================================================
+// MAC-based identity — picks ROBOT_NAME (Alvik1..Alvik4) from the WiFi MAC,
+// so each robot gets its own <ROBOT_NAME>_cmd / <ROBOT_NAME>_status topics.
+// =============================================================================
+// Old mac address if we have 6 workstation
+// int getAlvikID() {
+//  String mac = WiFi.macAddress();
+//  mac.toUpperCase();
+//  if (mac == "3C:84:27:C2:87:50") return 1;   // Alvik1
+//  if (mac == "3C:84:27:C3:E8:4C") return 2;   // Alvik2
+//  if (mac == "74:4D:BD:A2:1B:70") return 3;   // Alvik3 Fault in yellow detection. Low H value
+//  if (mac == "48:CA:43:2E:1D:CC") return 4;   // Alvik4
+//  if (mac == "3C:84:27:C3:EB:54") return 5;  //  Alvik5 Fault in yellow detection. Low H value
+//  if (mac == "48:CA:43:2E:32:FC") return 6;  // Alvik6 
+//  return 1;
+// }
+
+int getAlvikID() {
+ String mac = WiFi.macAddress();
+ mac.toUpperCase();
+ if (mac == "3C:84:27:C2:87:50") return 1;   // Alvik1
+ if (mac == "3C:84:27:C3:E8:4C") return 2;   // Alvik2
+ if (mac == "48:CA:43:2E:32:FC") return 3;  // Alvik3
+ if (mac == "48:CA:43:2E:1D:CC") return 4;   // Alvik4
+ return 1;
 }
 
 // =============================================================================
@@ -638,17 +694,17 @@ void initTransport() {
 bool initGraph() {
  allocator = rcl_get_default_allocator();
  if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) return false;
- if (rclc_node_init_default(&node, "agv_alvik_node", "", &support) != RCL_RET_OK) return false;
+ if (rclc_node_init_default(&node, ROBOT_NAME, "", &support) != RCL_RET_OK) return false;
 
  if (rclc_publisher_init_default(
  &pub_status, &node,
  ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
- "/agv/status") != RCL_RET_OK) return false;
+ T_STATUS) != RCL_RET_OK) return false;
 
  if (rclc_subscription_init_best_effort(
  &sub_cmd, &node,
  ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
- "/agv/cmd") != RCL_RET_OK) return false;
+ T_CMD) != RCL_RET_OK) return false;
 
  msg_cmd.data.data = cmd_buf;
  msg_cmd.data.size = 0;
@@ -682,6 +738,13 @@ void setup() {
 
  // 2. micro-ROS
  initTransport();
+
+ Serial.print("MAC: "); Serial.println(WiFi.macAddress());
+
+ snprintf(ROBOT_NAME, sizeof(ROBOT_NAME), "Alvik%d", getAlvikID());
+ snprintf(T_STATUS, sizeof(T_STATUS), "%s_status", ROBOT_NAME);
+ snprintf(T_CMD,    sizeof(T_CMD),    "%s_cmd",    ROBOT_NAME);
+
  ros_ready = initGraph();
 
  if (ros_ready) {

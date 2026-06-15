@@ -3,25 +3,30 @@
 juan_supervisor.py  —  Step-by-step command supervisor for juan_code.ino
 
 juan_code.ino is a thin executor: it accepts ONE atomic command at a time on
-/agv/cmd, executes it, and publishes status updates on /agv/status. The PC
-(this script) is the brain — it holds the full route and sends the next
-command only after the robot reports it has finished the current one.
+<ROBOT_NAME>_cmd, executes it, and publishes status updates on
+<ROBOT_NAME>_status (ROBOT_NAME is e.g. Alvik1, Alvik2, ... — each robot picks
+its own name from its WiFi MAC address). The PC (this script) is the brain —
+it holds the full route and sends the next command only after the robot
+reports it has finished the current one.
 
 Usage:
-    python3 juan_supervisor.py FORWARD_UNTIL_RED RIGHT_UNTIL_COLOR FORWARD_UNTIL_RED ...
+    python3 juan_supervisor.py --robot Alvik1 FORWARD_UNTIL_RED RIGHT_UNTIL_COLOR ...
 
     # or load a route from route_planner-style tokens (R/L/RED -> juan commands):
-    python3 juan_supervisor.py --tokens R,RED,RED,L,RED
+    python3 juan_supervisor.py --robot Alvik1 --tokens R,RED,RED,L,RED
 
     # or load a route from a file (one command per line, '#' comments allowed):
-    python3 juan_supervisor.py --file full_route_juan.txt
+    python3 juan_supervisor.py --robot Alvik1 --file full_route_juan.txt
 
-Recognized juan_code.ino commands (sent verbatim on /agv/cmd):
+Run one instance of this script per robot (each with its own --robot name and
+route) to control multiple AGVs at once.
+
+Recognized juan_code.ino commands (sent verbatim on <ROBOT_NAME>_cmd):
     FORWARD_UNTIL_RED     FORWARD_UNTIL_COLOR    BACKWARD_UNTIL_COLOR
     FORWARD_UNTIL_YELLOW  BACKWARD_UNTIL_YELLOW
     FORWARD_UNTIL_BLUE    BACKWARD_UNTIL_BLUE
     RIGHT_UNTIL_COLOR     LEFT_UNTIL_COLOR       ROTATE_180
-    STOP                  RESET_POSE             GET_STATUS
+    DWELL                 STOP                   RESET_POSE    GET_STATUS
 
 The robot reports "BUSY ..." while executing and "IDLE" (or "DETECTED ...",
 "TURN COMPLETE", "STOPPED", "POSE_RESET") when ready for the next command.
@@ -59,8 +64,8 @@ TOKEN_TO_CMD = {
 
 
 class JuanSupervisor(Node):
-    def __init__(self, commands: list[str]):
-        super().__init__("juan_supervisor")
+    def __init__(self, robot_name: str, commands: list[str]):
+        super().__init__(f"juan_supervisor_{robot_name.lower()}")
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
         self._commands = commands
@@ -68,11 +73,15 @@ class JuanSupervisor(Node):
         self._done_event = threading.Event()
         self._skip_next_idle = False
 
-        self._cmd_pub = self.create_publisher(String, "/agv/cmd", qos)
+        cmd_topic = f"{robot_name}_cmd"
+        status_topic = f"{robot_name}_status"
+        self._cmd_pub = self.create_publisher(String, cmd_topic, qos)
         self._status_sub = self.create_subscription(
-            String, "/agv/status", self._on_status, qos)
+            String, status_topic, self._on_status, qos)
 
-        self.get_logger().info(f"Loaded {len(commands)} command(s)")
+        self.get_logger().info(
+            f"Loaded {len(commands)} command(s) for {robot_name} "
+            f"(cmd={cmd_topic}, status={status_topic})")
 
     def _on_status(self, msg: String):
         text = msg.data.strip()
@@ -148,21 +157,27 @@ def main():
         print(__doc__)
         sys.exit(1)
 
+    if args[0] != "--robot" or len(args) < 3:
+        print("usage: juan_supervisor.py --robot AlvikN <commands | --tokens ... | --file ...>")
+        sys.exit(1)
+    robot_name = args[1]
+    args = args[2:]
+
     if args[0] == "--tokens":
         if len(args) != 2:
-            print("usage: juan_supervisor.py --tokens R,RED,RED,L,RED")
+            print("usage: juan_supervisor.py --robot AlvikN --tokens R,RED,RED,L,RED")
             sys.exit(1)
         commands = tokens_to_commands(args[1])
     elif args[0] == "--file":
         if len(args) != 2:
-            print("usage: juan_supervisor.py --file route.txt")
+            print("usage: juan_supervisor.py --robot AlvikN --file route.txt")
             sys.exit(1)
         commands = commands_from_file(args[1])
     else:
         commands = [a.upper() for a in args]
 
     rclpy.init()
-    node = JuanSupervisor(commands)
+    node = JuanSupervisor(robot_name, commands)
 
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
